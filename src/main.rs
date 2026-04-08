@@ -236,15 +236,11 @@ fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str, o
     // Zot rejects some Docker v2 manifests with MANIFEST_INVALID.
     // Converting to OCI format during copy always works.
     //
-    // Write a permissive trust policy if none exists (required by skopeo).
-    let policy_path = "/tmp/containers-policy.json";
-    if !std::path::Path::new(policy_path).exists() {
-        let _ = std::fs::write(policy_path, r#"{"default":[{"type":"insecureAcceptAnything"}]}"#);
-    }
+    let policy_path = std::env::temp_dir().join("containers-policy.json");
 
     let mut skopeo_args = vec![
         "copy".to_string(),
-        "--policy".to_string(), policy_path.to_string(),
+        "--policy".to_string(), policy_path.to_string_lossy().to_string(),
         "--format".to_string(), "oci".to_string(),
         "--override-arch".to_string(), opts.platform.split('/').nth(1).unwrap_or("amd64").to_string(),
         "--override-os".to_string(), opts.platform.split('/').next().unwrap_or("linux").to_string(),
@@ -401,6 +397,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+
+    // Write a permissive trust policy for skopeo (required in containers
+    // where /etc/containers/policy.json doesn't exist).
+    let policy_dir = std::env::temp_dir();
+    std::fs::create_dir_all(&policy_dir).ok();
+    let policy_path = policy_dir.join("containers-policy.json");
+    std::fs::write(&policy_path, r#"{"default":[{"type":"insecureAcceptAnything"}]}"#)
+        .unwrap_or_else(|e| tracing::warn!("failed to write trust policy: {e}"));
 
     tracing::info!(
         cache_registry = %config.cache_registry,
