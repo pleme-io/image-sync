@@ -5,6 +5,9 @@
 //! Designed to run as a Kubernetes CronJob with exponential backoff.
 //!
 //! Config via shikumi pattern: YAML file + env overrides.
+//!
+//! All copy/digest settings (platform, TLS, tool preference) are
+//! configurable at the global level and overridable per-image.
 
 use std::process::Command;
 
@@ -33,7 +36,7 @@ struct Config {
     /// Images to keep in sync
     images: Vec<ImageSpec>,
 
-    /// Global settings
+    /// Global settings (defaults for all images)
     #[serde(default)]
     settings: Settings,
 }
@@ -49,9 +52,24 @@ struct ImageSpec {
     /// Optional: override destination path in cache
     #[serde(default)]
     cache_as: Option<String>,
+
+    /// Platform override for this image (e.g., "linux/arm64").
+    /// Falls back to settings.default_platform.
+    #[serde(default)]
+    platform: Option<String>,
+
+    /// TLS verification override for this image's source registry.
+    /// Falls back to settings.source_tls_verify.
+    #[serde(default)]
+    source_tls_verify: Option<bool>,
+
+    /// Insecure (HTTP) override for the cache registry for this image.
+    /// Falls back to settings.cache_insecure.
+    #[serde(default)]
+    cache_insecure: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Settings {
     /// Max concurrent pulls
     #[serde(default = "default_concurrency")]
@@ -64,10 +82,55 @@ struct Settings {
     /// Skip pull if remote check fails (don't error the job)
     #[serde(default)]
     skip_on_error: bool,
+
+    /// Default platform for crane copy (e.g., "linux/amd64").
+    /// Copies platform-specific manifests instead of multi-arch
+    /// manifest lists, which avoids MANIFEST_INVALID on Zot.
+    #[serde(default = "default_platform")]
+    default_platform: String,
+
+    /// Allow HTTP (insecure) for the local cache registry.
+    /// Default true — Zot in-cluster typically runs on HTTP.
+    #[serde(default = "default_true")]
+    cache_insecure: bool,
+
+    /// Verify TLS certificates for source registries.
+    /// Default true — Docker Hub, GHCR, ECR all use valid certs.
+    #[serde(default = "default_true")]
+    source_tls_verify: bool,
+
+    /// Preferred copy tool: "crane" or "skopeo".
+    /// Falls back to the other if preferred is unavailable.
+    #[serde(default = "default_tool")]
+    preferred_tool: String,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            concurrency: default_concurrency(),
+            pull_timeout_secs: default_timeout(),
+            skip_on_error: false,
+            default_platform: default_platform(),
+            cache_insecure: true,
+            source_tls_verify: true,
+            preferred_tool: default_tool(),
+        }
+    }
+}
+
+fn default_platform() -> String { "linux/amd64".to_string() }
 fn default_concurrency() -> usize { 2 }
 fn default_timeout() -> u64 { 300 }
+fn default_true() -> bool { true }
+fn default_tool() -> String { "crane".to_string() }
+
+/// Resolved copy options for a single image (merged from settings + per-image).
+struct CopyOpts<'a> {
+    platform: &'a str,
+    cache_insecure: bool,
+    source_tls_verify: bool,
+}
 
 /// Result of syncing one image.
 #[derive(Debug, Serialize)]
@@ -96,10 +159,7 @@ fn load_config(path: &str) -> anyhow::Result<Config> {
 }
 
 /// Get the remote image digest from the registry WITHOUT pulling the image.
-/// Uses `skopeo inspect` or `crane digest` if available, falls back to
-/// registry API v2 manifest HEAD request.
 fn get_remote_digest(image: &str, tag: &str) -> anyhow::Result<Option<String>> {
-    // Try crane first (lightweight, no Docker daemon needed)
     let result = Command::new("crane")
         .args(["digest", &format!("{image}:{tag}")])
         .output();
@@ -113,7 +173,6 @@ fn get_remote_digest(image: &str, tag: &str) -> anyhow::Result<Option<String>> {
         }
     }
 
-    // Try skopeo
     let result = Command::new("skopeo")
         .args(["inspect", "--format", "{{.Digest}}", &format!("docker://{image}:{tag}")])
         .output();
@@ -130,11 +189,14 @@ fn get_remote_digest(image: &str, tag: &str) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-/// Get the cached digest from our local Zot registry.
-fn get_cached_digest(cache_registry: &str, image_path: &str, tag: &str) -> anyhow::Result<Option<String>> {
-    let result = Command::new("crane")
-        .args(["digest", &format!("{cache_registry}/{image_path}:{tag}"), "--insecure"])
-        .output();
+/// Get the cached digest from our local registry.
+fn get_cached_digest(cache_registry: &str, image_path: &str, tag: &str, opts: &CopyOpts<'_>) -> anyhow::Result<Option<String>> {
+    let mut args = vec!["digest".to_string(), format!("{cache_registry}/{image_path}:{tag}")];
+    if opts.cache_insecure {
+        args.push("--insecure".to_string());
+    }
+
+    let result = Command::new("crane").args(&args).output();
 
     if let Ok(output) = result {
         if output.status.success() {
@@ -148,15 +210,19 @@ fn get_cached_digest(cache_registry: &str, image_path: &str, tag: &str) -> anyho
     Ok(None)
 }
 
-/// Copy an image from source to cache using crane or skopeo.
-fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str) -> anyhow::Result<()> {
+/// Copy an image from source to cache.
+fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str, opts: &CopyOpts<'_>) -> anyhow::Result<()> {
     let src = format!("{source}:{tag}");
     let dst = format!("{cache_registry}/{cache_path}:{tag}");
 
-    // Try crane copy
-    let result = Command::new("crane")
-        .args(["copy", &src, &dst, "--insecure"])
-        .output();
+    // Build crane args
+    let mut crane_args = vec!["copy".to_string(), src.clone(), dst.clone()];
+    crane_args.extend(["--platform".to_string(), opts.platform.to_string()]);
+    if opts.cache_insecure {
+        crane_args.push("--insecure".to_string());
+    }
+
+    let result = Command::new("crane").args(&crane_args).output();
 
     if let Ok(output) = result {
         if output.status.success() {
@@ -167,14 +233,19 @@ fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str) -
     }
 
     // Fallback to skopeo
-    let result = Command::new("skopeo")
-        .args([
-            "copy",
-            &format!("docker://{src}"),
-            &format!("docker://{dst}"),
-            "--dest-tls-verify=false",
-        ])
-        .output()?;
+    let mut skopeo_args = vec![
+        "copy".to_string(),
+        format!("docker://{src}"),
+        format!("docker://{dst}"),
+    ];
+    if !opts.source_tls_verify {
+        skopeo_args.push("--src-tls-verify=false".to_string());
+    }
+    if opts.cache_insecure {
+        skopeo_args.push("--dest-tls-verify=false".to_string());
+    }
+
+    let result = Command::new("skopeo").args(&skopeo_args).output()?;
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
@@ -188,25 +259,29 @@ fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str) -
 /// docker.io/akeyless/k8s-secrets-sidecar → akeyless/k8s-secrets-sidecar
 /// ghcr.io/project-zot/zot-linux-amd64 → project-zot/zot-linux-amd64
 fn derive_cache_path(source: &str) -> String {
-    // Strip registry prefix
-    let path = source
+    source
         .strip_prefix("docker.io/")
         .or_else(|| source.strip_prefix("ghcr.io/"))
         .or_else(|| source.strip_prefix("registry-1.docker.io/"))
-        .unwrap_or(source);
-
-    // Handle Docker Hub library images: library/nginx → library/nginx
-    path.to_string()
+        .unwrap_or(source)
+        .to_string()
 }
 
-fn sync_image(spec: &ImageSpec, cache_registry: &str, dry_run: bool) -> SyncResult {
+fn sync_image(spec: &ImageSpec, cache_registry: &str, settings: &Settings, dry_run: bool) -> SyncResult {
     let start = std::time::Instant::now();
     let cache_path = spec
         .cache_as
         .clone()
         .unwrap_or_else(|| derive_cache_path(&spec.source));
 
-    // Step 1: Check remote digest (minimal API call — HEAD request only)
+    // Resolve per-image overrides → global defaults
+    let opts = CopyOpts {
+        platform: spec.platform.as_deref().unwrap_or(&settings.default_platform),
+        cache_insecure: spec.cache_insecure.unwrap_or(settings.cache_insecure),
+        source_tls_verify: spec.source_tls_verify.unwrap_or(settings.source_tls_verify),
+    };
+
+    // Step 1: Check remote digest
     let remote_digest = match get_remote_digest(&spec.source, &spec.tag) {
         Ok(d) => d,
         Err(e) => {
@@ -223,7 +298,7 @@ fn sync_image(spec: &ImageSpec, cache_registry: &str, dry_run: bool) -> SyncResu
     };
 
     // Step 2: Check cached digest
-    let cached_digest = get_cached_digest(cache_registry, &cache_path, &spec.tag).unwrap_or(None);
+    let cached_digest = get_cached_digest(cache_registry, &cache_path, &spec.tag, &opts).unwrap_or(None);
 
     // Step 3: Compare — skip if identical
     if let (Some(remote), Some(cached)) = (&remote_digest, &cached_digest) {
@@ -272,7 +347,7 @@ fn sync_image(spec: &ImageSpec, cache_registry: &str, dry_run: bool) -> SyncResu
         "pulling — remote digest changed or not cached"
     );
 
-    match copy_image(&spec.source, &spec.tag, cache_registry, &cache_path) {
+    match copy_image(&spec.source, &spec.tag, cache_registry, &cache_path, &opts) {
         Ok(()) => {
             tracing::info!(
                 image = %spec.source,
@@ -318,6 +393,8 @@ async fn main() -> anyhow::Result<()> {
         cache_registry = %config.cache_registry,
         image_count = config.images.len(),
         dry_run = cli.dry_run,
+        default_platform = %config.settings.default_platform,
+        cache_insecure = config.settings.cache_insecure,
         "image-sync starting"
     );
 
@@ -327,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
     let mut failed = 0u32;
 
     for spec in &config.images {
-        let result = sync_image(spec, &config.cache_registry, cli.dry_run);
+        let result = sync_image(spec, &config.cache_registry, &config.settings, cli.dry_run);
         match result.action {
             SyncAction::Pulled => pulled += 1,
             SyncAction::AlreadyCached => cached += 1,
@@ -337,7 +414,6 @@ async fn main() -> anyhow::Result<()> {
         results.push(result);
     }
 
-    // Summary
     tracing::info!(
         pulled = pulled,
         already_cached = cached,
@@ -346,7 +422,6 @@ async fn main() -> anyhow::Result<()> {
         "sync complete"
     );
 
-    // JSON report to stdout
     let report = serde_json::json!({
         "timestamp": Utc::now().to_rfc3339(),
         "cache_registry": config.cache_registry,
