@@ -34,7 +34,7 @@
       src = self;
       repo = "pleme-io/image-sync";
       tag = "0.1.0";
-      extraContents = pkgs: [ pkgs.crane ];
+      extraContents = pkgs: [ pkgs.crane pkgs.skopeo ];
       architectures = ["amd64" "arm64"];
     };
 }
