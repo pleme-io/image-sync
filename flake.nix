@@ -34,7 +34,13 @@
       src = self;
       repo = "pleme-io/image-sync";
       tag = "0.1.0";
-      extraContents = pkgs: [ pkgs.crane pkgs.skopeo ];
+      extraContents = pkgs: [
+        pkgs.crane
+        pkgs.skopeo
+        # Skopeo requires a trust policy. Bake a permissive one into the image.
+        (pkgs.writeTextDir "etc/containers/policy.json"
+          ''{"default":[{"type":"insecureAcceptAnything"}]}'')
+      ];
       architectures = ["amd64" "arm64"];
     };
 }
