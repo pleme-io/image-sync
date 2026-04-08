@@ -232,9 +232,14 @@ fn copy_image(source: &str, tag: &str, cache_registry: &str, cache_path: &str, o
         tracing::warn!("crane copy failed: {stderr}");
     }
 
-    // Fallback to skopeo
+    // Fallback to skopeo with OCI manifest format.
+    // Zot rejects some Docker v2 manifests with MANIFEST_INVALID.
+    // Converting to OCI format during copy always works.
     let mut skopeo_args = vec![
         "copy".to_string(),
+        "--format".to_string(), "oci".to_string(),
+        "--override-arch".to_string(), opts.platform.split('/').nth(1).unwrap_or("amd64").to_string(),
+        "--override-os".to_string(), opts.platform.split('/').next().unwrap_or("linux").to_string(),
         format!("docker://{src}"),
         format!("docker://{dst}"),
     ];
